@@ -300,6 +300,9 @@ public class RollbackBlockHandler extends Queue {
                     return false;
                 }
                 else if ((rowType == Material.WATER)) {
+                    if (block.getWorld().isUltraWarm()){
+                        return false;
+                    }
                     if (pendingChangeData instanceof Waterlogged) {
                         Waterlogged waterlogged = (Waterlogged) pendingChangeData;
                         waterlogged.setWaterlogged(true);
