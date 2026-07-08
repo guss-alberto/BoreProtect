@@ -1,9 +1,9 @@
 package net.coreprotect.listener.player;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -13,6 +13,8 @@ import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockState;
 import org.bukkit.block.DoubleChest;
+import org.bukkit.block.Hopper;
+import org.bukkit.entity.Item;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
@@ -22,6 +24,7 @@ import org.bukkit.event.inventory.InventoryAction;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
 import org.bukkit.event.inventory.InventoryMoveItemEvent;
+import org.bukkit.event.inventory.InventoryPickupItemEvent;
 import org.bukkit.event.inventory.InventoryType;
 import org.bukkit.inventory.BlockInventoryHolder;
 import org.bukkit.inventory.Inventory;
@@ -36,8 +39,10 @@ import net.coreprotect.consumer.Queue;
 import net.coreprotect.model.BlockGroup;
 import net.coreprotect.paper.PaperAdapter;
 import net.coreprotect.thread.Scheduler;
+import net.coreprotect.utility.HopperTransactionUtils;
 import net.coreprotect.utility.ItemUtils;
 import net.coreprotect.utility.Validate;
+import net.coreprotect.utility.ErrorReporter;
 import us.lynuxcraft.deadsilenceiv.advancedchests.AdvancedChestsAPI;
 import us.lynuxcraft.deadsilenceiv.advancedchests.chest.AdvancedChest;
 
@@ -72,19 +77,25 @@ public final class InventoryChangeListener extends Queue implements Listener {
             }
         }
         catch (Exception e) {
-            e.printStackTrace();
+            ErrorReporter.report(e);
         }
     }
 
     public static boolean inventoryTransaction(String user, Location location, ItemStack[] inventoryData) {
-        if (user != null && location != null) {
+        if (location != null) {
+            return inventoryTransaction(user, location.getBlock().getState(), inventoryData);
+        }
+        return false;
+    }
+
+    public static boolean inventoryTransaction(String user, BlockState blockState, ItemStack[] inventoryData) {
+        if (user != null && blockState != null) {
             if (user.length() > 0) {
-                BlockState blockState = location.getBlock().getState();
                 Material type = blockState.getType();
 
                 if (BlockGroup.CONTAINERS.contains(type) && blockState instanceof InventoryHolder) {
                     InventoryHolder inventoryHolder = (InventoryHolder) blockState;
-                    return onInventoryInteract(user, inventoryHolder.getInventory(), inventoryData, null, location, false);
+                    return onInventoryInteract(user, inventoryHolder.getInventory(), inventoryData, null, blockState.getLocation(), false);
                 }
             }
         }
@@ -139,101 +150,84 @@ public final class InventoryChangeListener extends Queue implements Listener {
                         inventoryData = inventory.getContents();
                     }
 
-                    int x = playerLocation.getBlockX();
-                    int y = playerLocation.getBlockY();
-                    int z = playerLocation.getBlockZ();
-
-                    String transactingChestId = playerLocation.getWorld().getUID().toString() + "." + x + "." + y + "." + z;
-                    String loggingChestId = user.toLowerCase(Locale.ROOT) + "." + x + "." + y + "." + z;
-                    for (String loggingChestIdViewer : ConfigHandler.oldContainer.keySet()) {
-                        if (loggingChestIdViewer.equals(loggingChestId) || !loggingChestIdViewer.endsWith("." + x + "." + y + "." + z)) {
-                            continue;
-                        }
-
-                        if (ConfigHandler.oldContainer.get(loggingChestIdViewer) != null) { // player has pending consumer item
-                            int sizeOld = ConfigHandler.oldContainer.get(loggingChestIdViewer).size();
-                            ConfigHandler.forceContainer.computeIfAbsent(loggingChestIdViewer, k -> new ArrayList<>());
-                            List<ItemStack[]> list = ConfigHandler.forceContainer.get(loggingChestIdViewer);
-
-                            if (list != null && list.size() < sizeOld) {
-                                ItemStack[] containerState = ItemUtils.getContainerState(inventoryData);
-
-                                // If items have been removed by a hopper, merge into containerState
-                                List<Object> transactingChest = ConfigHandler.transactingChest.get(transactingChestId);
-                                if (transactingChest != null) {
-                                    List<Object> transactingChestList = Collections.synchronizedList(new ArrayList<>(transactingChest));
-                                    if (!transactingChestList.isEmpty()) {
-                                        ItemStack[] newState = new ItemStack[containerState.length + transactingChestList.size()];
-                                        int count = 0;
-
-                                        for (int j = 0; j < containerState.length; j++) {
-                                            newState[j] = containerState[j];
-                                            count++;
-                                        }
-
-                                        for (Object item : transactingChestList) {
-                                            ItemStack addItem = null;
-                                            ItemStack removeItem = null;
-                                            if (item instanceof ItemStack) {
-                                                addItem = (ItemStack) item;
-                                            }
-                                            else {
-                                                addItem = ((ItemStack[]) item)[0];
-                                                removeItem = ((ItemStack[]) item)[1];
-                                            }
-
-                                            // item was removed by hopper, add back to state
-                                            if (addItem != null) {
-                                                newState[count] = addItem;
-                                                count++;
-                                            }
-
-                                            // item was added by hopper, remove from state
-                                            if (removeItem != null) {
-                                                for (ItemStack check : newState) {
-                                                    if (check != null && check.isSimilar(removeItem)) {
-                                                        check.setAmount(check.getAmount() - 1);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        containerState = newState;
-                                    }
-                                }
-
-                                modifyForceContainer(loggingChestIdViewer, containerState);
-                            }
-                        }
-                    }
-
-                    int chestId = getChestId(loggingChestId);
-                    if (chestId > 0) {
-                        List<ItemStack[]> forceList = ConfigHandler.forceContainer.get(loggingChestId);
-                        if (forceList != null) {
-                            int forceSize = forceList.size();
-                            List<ItemStack[]> list = ConfigHandler.oldContainer.get(loggingChestId);
-
-                            if (list != null && list.size() <= forceSize) {
-                                list.add(ItemUtils.getContainerState(inventoryData));
-                                ConfigHandler.oldContainer.put(loggingChestId, list);
-                            }
-                        }
-                    }
-                    else {
-                        List<ItemStack[]> list = new ArrayList<>();
-                        list.add(ItemUtils.getContainerState(inventoryData));
-                        ConfigHandler.oldContainer.put(loggingChestId, list);
-                    }
-
-                    ConfigHandler.transactingChest.computeIfAbsent(transactingChestId, k -> Collections.synchronizedList(new ArrayList<>()));
-                    Queue.queueContainerTransaction(user, playerLocation, type, inventory, chestId);
-                    return true;
+                    return queueContainerTransaction(user, playerLocation, type, inventory, inventoryData, null, null);
                 }
             }
         }
 
         return false;
+    }
+
+    private static boolean queueContainerTransaction(String user, Location playerLocation, Material type, Object inventory, ItemStack[] inventoryData, ItemStack[] forceInventoryData, ItemStack batchItem) {
+        String transactingChestId = HopperTransactionUtils.getTransactionId(playerLocation);
+        String loggingChestIdSuffix = HopperTransactionUtils.getLoggingIdSuffix(playerLocation);
+        String loggingChestId = HopperTransactionUtils.getLoggingId(user, loggingChestIdSuffix);
+        Set<String> locationViewers = ConfigHandler.oldContainerViewers.get(loggingChestIdSuffix);
+        if (locationViewers != null) {
+            for (String loggingChestIdViewer : locationViewers) {
+                if (loggingChestIdViewer.equals(loggingChestId)) {
+                    continue;
+                }
+
+                List<ItemStack[]> viewerOldList = ConfigHandler.oldContainer.get(loggingChestIdViewer);
+                if (viewerOldList != null) { // viewer has pending consumer item
+                    int sizeOld = viewerOldList.size();
+                    List<ItemStack[]> list = ConfigHandler.forceContainer.computeIfAbsent(loggingChestIdViewer, k -> new ArrayList<>());
+
+                    if (list.size() < sizeOld) {
+                        ItemStack[] containerState = ItemUtils.getContainerState(inventoryData);
+
+                        long snapshotMark = HopperTransactionUtils.getSnapshotMark(transactingChestId, loggingChestIdViewer, list.size());
+                        containerState = HopperTransactionUtils.applyPendingChanges(containerState, transactingChestId, snapshotMark);
+
+                        modifyForceContainer(loggingChestIdViewer, containerState);
+                    }
+                }
+            }
+        }
+
+        if (forceInventoryData == null && batchItem != null && HopperTransactionUtils.shouldForceBatchBoundary(transactingChestId, loggingChestId, batchItem)) {
+            forceInventoryData = inventoryData;
+        }
+        if (forceInventoryData != null) {
+            ConfigHandler.forceContainer.computeIfAbsent(loggingChestId, k -> new ArrayList<>()).add(ItemUtils.getContainerState(forceInventoryData));
+        }
+
+        int chestId = getChestId(loggingChestId);
+        if (chestId > 0) {
+            List<ItemStack[]> forceList = ConfigHandler.forceContainer.get(loggingChestId);
+            if (forceList != null) {
+                int forceSize = forceList.size();
+                List<ItemStack[]> list = ConfigHandler.oldContainer.get(loggingChestId);
+
+                if (list != null && list.size() <= forceSize) {
+                    list.add(ItemUtils.getContainerState(inventoryData));
+                    ConfigHandler.oldContainer.put(loggingChestId, list);
+                    HopperTransactionUtils.registerSnapshot(transactingChestId, loggingChestId, false);
+                }
+            }
+        }
+        else {
+            List<ItemStack[]> list = new ArrayList<>();
+            list.add(ItemUtils.getContainerState(inventoryData));
+            ConfigHandler.oldContainer.put(loggingChestId, list);
+            ConfigHandler.addOldContainerViewer(loggingChestIdSuffix, loggingChestId);
+            HopperTransactionUtils.registerSnapshot(transactingChestId, loggingChestId, true);
+        }
+
+        Queue.queueContainerTransaction(user, playerLocation, type, inventory, chestId);
+        return true;
+    }
+
+    static boolean onHopperInventoryInteract(String user, Inventory inventory, ItemStack[] inventoryData, Location location, ItemStack movedItem) {
+        if (inventory == null || location == null) {
+            return false;
+        }
+        if (!Config.getConfig(location.getWorld()).ITEM_TRANSACTIONS) {
+            return false;
+        }
+
+        return queueContainerTransaction(user, location, Material.CHEST, inventory, inventoryData, null, movedItem);
     }
 
     static void onInventoryInteractAsync(Player player, Inventory inventory, boolean enderChest) {
@@ -286,7 +280,7 @@ public final class InventoryChangeListener extends Queue implements Listener {
                 onInventoryInteract(player.getName(), inventory, containerState, containerType, inventoryLocation, true);
             }
             catch (Exception e) {
-                e.printStackTrace();
+                ErrorReporter.report(e);
             }
         });
     }
@@ -534,12 +528,111 @@ public final class InventoryChangeListener extends Queue implements Listener {
             return;
         }
 
-        List<Object> list = ConfigHandler.transactingChest.get(location.getWorld().getUID().toString() + "." + location.getBlockX() + "." + location.getBlockY() + "." + location.getBlockZ());
-        if (list == null) {
+        String transactingChestId = HopperTransactionUtils.getTransactionId(location);
+        if (!HopperTransactionUtils.hasTransaction(transactingChestId)) {
             return;
         }
 
         HopperPullListener.processHopperPull(location, "#hopper", sourceHolder, destinationHolder, event.getItem());
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    protected void onInventoryPickupItem(InventoryPickupItemEvent event) {
+        Inventory inventory = event.getInventory();
+        if (inventory == null) {
+            return;
+        }
+
+        InventoryHolder holder = PaperAdapter.ADAPTER.getHolder(inventory, false);
+        if (!(holder instanceof Hopper)) {
+            return;
+        }
+
+        Location location = inventory.getLocation();
+        if (location == null) {
+            location = ((Hopper) holder).getLocation();
+        }
+
+        if (location == null || !Config.getConfig(location.getWorld()).ITEM_TRANSACTIONS) {
+            return;
+        }
+
+        Item item = event.getItem();
+        if (item == null) {
+            return;
+        }
+
+        ItemStack[] oldContents = ItemUtils.getContainerState(inventory.getContents());
+        ItemStack[] newContents = addPickedItem(oldContents, item.getItemStack(), inventory.getMaxStackSize());
+        if (newContents == null) {
+            return;
+        }
+
+        String user = PlayerDropItemListener.getDroppedItemUser(item.getUniqueId());
+        if (user == null) {
+            user = "#hopper";
+        }
+
+        queueContainerTransaction(user, location, Material.HOPPER, newContents, oldContents, newContents, null);
+    }
+
+    private static ItemStack[] addPickedItem(ItemStack[] contents, ItemStack itemStack, int inventoryMaxStackSize) {
+        if (contents == null || itemStack == null || itemStack.getAmount() <= 0 || itemStack.getType() == Material.AIR) {
+            return null;
+        }
+
+        ItemStack[] result = ItemUtils.getContainerState(contents);
+        ItemStack pickedItem = itemStack.clone();
+        int remaining = pickedItem.getAmount();
+
+        for (ItemStack item : result) {
+            if (remaining <= 0) {
+                break;
+            }
+
+            if (item == null || item.getType() == Material.AIR || !item.isSimilar(pickedItem)) {
+                continue;
+            }
+
+            int maxStackSize = getMaxStackSize(item, inventoryMaxStackSize);
+            int accepted = Math.min(remaining, maxStackSize - item.getAmount());
+            if (accepted > 0) {
+                item.setAmount(item.getAmount() + accepted);
+                remaining -= accepted;
+            }
+        }
+
+        for (int i = 0; i < result.length && remaining > 0; i++) {
+            ItemStack item = result[i];
+            if (item != null && item.getType() != Material.AIR) {
+                continue;
+            }
+
+            int accepted = Math.min(remaining, getMaxStackSize(pickedItem, inventoryMaxStackSize));
+            ItemStack addedItem = pickedItem.clone();
+            addedItem.setAmount(accepted);
+            result[i] = addedItem;
+            remaining -= accepted;
+        }
+
+        if (remaining == pickedItem.getAmount()) {
+            return null;
+        }
+
+        return result;
+    }
+
+    private static int getMaxStackSize(ItemStack itemStack, int inventoryMaxStackSize) {
+        int maxStackSize = itemStack.getMaxStackSize();
+        if (inventoryMaxStackSize > 0 && (inventoryMaxStackSize < maxStackSize || maxStackSize == -1)) {
+            maxStackSize = inventoryMaxStackSize;
+        }
+
+        if (maxStackSize == -1) {
+            return 1;
+        }
+
+        return maxStackSize;
     }
 
     private boolean isAdvancedChest(Inventory inventory) {
